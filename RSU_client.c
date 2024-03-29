@@ -11,6 +11,7 @@
 //#define POST_DATA "name=daniel&project=curl"
 #define POST_DATA "RSUNAME=S290002&RSUID=16004&SIGNAL_CONTROLLER_MANUFACTURER=cheng_long\
                   &RSULAT=25.221324&RSULONG=124.958430"
+#define EMPTY_POST ""
 #define PORT            8888
 #define POSTBUFFERSIZE  2048
 
@@ -19,6 +20,7 @@
 //#define SERVER_URL "http://127.0.0.1:10168/api/"
 #define SERVER_URL_ex "https://example.com"
 
+//empty curl request: curl --request POST '140.116.245.163:10168/api'
 static int oneone;
 
 /*write data buffer*/
@@ -285,10 +287,10 @@ int
 main (int argc, char *const *argv)
 {
   unsigned int errorCount = 0;
-  //errorCount += testPost ();
+  errorCount += testPost ();
   //errorCount += testGet ();
-  errorCount += testPostForm ();
-  errorCount += testGet ();
+  //errorCount += testPostForm ();
+  //errorCount += testGet ();
   if (errorCount != 0)
     fprintf (stderr, "Error (code: %u)\n", errorCount);
   curl_global_cleanup ();

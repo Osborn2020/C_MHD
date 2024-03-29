@@ -26,6 +26,19 @@ struct CBC
   size_t size;
 };
 
+/*write function for CURL*/
+static size_t
+copyBuffer (void *ptr, size_t size, size_t nmemb, void *ctx)
+{
+  struct CBC *cbc = ctx;
+
+  if (cbc->pos + size * nmemb > cbc->size)
+    return 0;                   /* overflow */
+  memcpy (&cbc->buf[cbc->pos], ptr, size * nmemb);
+  cbc->pos += size * nmemb;
+  return size * nmemb;
+}
+
 enum ConnectionType
 {
   GET = 0,
@@ -67,7 +80,7 @@ struct connection_info_struct
    */
   char value[1024];
 
-  unsigned int posttype;
+  int posttype;
 
   char *filename[100];
 };
@@ -138,10 +151,17 @@ parse_url (void *cls,
 {
   int num_of_keys = 0;
   int matches = 0;
+
+  printf("key: %s\n",key);
   if (0 == strcmp (key, "file"))
   {
     matches = 99; //unique value for FILE posts
     num_of_keys += 1;
+    return matches;
+  }
+  else if (0 == strcmp (key, "")) {
+    printf("error: no keys obtained!");
+    matches = -1;
     return matches;
   }
   else 
@@ -166,7 +186,7 @@ parse_url (void *cls,
  * in that it fails to support incremental processing.
  * (to be fixed in the future)
  */
-static int
+static enum MHD_Result
 iterate_post_string (void *cls,
                enum MHD_ValueKind kind,
                const char *key,
@@ -176,6 +196,10 @@ iterate_post_string (void *cls,
                const char *value, uint64_t off, size_t size)
 {
   struct connection_info_struct *con_info = cls;
+  if (key==NULL || strlen(key)==0) {
+    printf("error: cannot accept empty key\n")
+    return MHD_NO;
+  }
   printf("key: %s\n",key);
   printf("value: %s\n",value);
   //printf("content_type: %s\n",content_type);
@@ -195,7 +219,7 @@ iterate_post_string (void *cls,
 }
 
 /* send file through POST */
-static int
+static enum MHD_Result
 iterate_post_file (void *coninfo_cls,
               enum MHD_ValueKind kind,
               const char *key,
@@ -293,12 +317,22 @@ request_completed (void *cls,
   printf("request complete\n");
   
   struct connection_info_struct *con_info = *con_cls;
-  if (nr_of_uploading_clients<=MAXCLIENTS) {
-    printf("con_info->posttype: %d\n",con_info->posttype);
-    printf("con_info->connectiontype: %d\n",con_info->connectiontype); //confirm connection type
-    printf("%s\n",con_info->connectiontype == POST ? "true" : "false");
+  enum XToe = toe;
+  if (XToe==MHD_REQUEST_TERMINATED_WITH_ERROR) {
+    printf("connection suffered an error\n");
+    memset(&con_info->value[0], 0, sizeof(con_info->value)); // reset connection info POST value
+    memset(&con_info->filename[0], 0, sizeof(con_info->filename));
+    if (NULL != con_info->pp)
+    {
+      MHD_destroy_post_processor (con_info->pp);  
+    }
+
+    if (con_info->fp)
+      fclose (con_info->fp);
+    
+    *con_cls = NULL;
+    return;
   }
-  
   //(void) cls;         /* Unused. Silent compiler warning. */
   //(void) connection;  /* Unused. Silent compiler warning. */
   //(void) toe;         /* Unused. Silent compiler warning. */
@@ -308,9 +342,6 @@ request_completed (void *cls,
     *con_cls = NULL;
     return;
   }
-
-  //strcpy(con_info->answerstring,"");
-    
 
   if (1 == (con_info->connectiontype == POST))// is POST
   {
@@ -335,7 +366,7 @@ request_completed (void *cls,
   *con_cls = NULL;
 }
 
-static int
+static enum MHD_result
 echo_response (void *cls,
           struct MHD_Connection *connection,
           const char *url,
@@ -351,6 +382,7 @@ echo_response (void *cls,
   
   printf("URL: %s\n",url);
   printf("method: %s\n",method);
+  printf("upload_data: %s\n",upload_data);
   
   
   if (NULL == *con_cls)
@@ -368,14 +400,17 @@ echo_response (void *cls,
       return MHD_NO;
     con_info->answercode = 0;   /* none yet */
     con_info->fp = NULL;
+    con_info->posttype = -1;
     strcpy(con_info->value,"");
+    strcpy(con_info->filename,"");
+    // parse url for "file" key
+    con_info->posttype = MHD_get_connection_values (connection,
+          MHD_GET_ARGUMENT_KIND,
+          &parse_url,
+          NULL);
     if (0 == strcasecmp (method, MHD_HTTP_METHOD_POST))
     {
-      // parse url for "file" key
-      con_info->posttype = MHD_get_connection_values (connection,
-			     MHD_GET_ARGUMENT_KIND,
-			     &parse_url,
-			     NULL);
+      
       if (con_info->posttype==99) { // has "file" key
         printf("handle as file POST\n");
         con_info->pp =
@@ -392,6 +427,7 @@ echo_response (void *cls,
       }
       else { // no "file" key, POST data is string type or form type
         printf("handle as string POST\n");
+        printf("con_info->posttype: %d\n",con_info->posttype);
         con_info->pp =
           MHD_create_post_processor (connection,
                                      POSTBUFFERSIZE,
@@ -416,7 +452,6 @@ echo_response (void *cls,
     }
     printf("confirmed request: %d\n",con_info->connectiontype);
     *con_cls = (void *) con_info;
-
     return MHD_YES;
   }
   
@@ -426,11 +461,7 @@ echo_response (void *cls,
     struct connection_info_struct *con_info = *con_cls;
     //char* buffer= (char*)malloc(sizeof(2048));
     //*buffer = 0;
-    con_info->answercode = MHD_HTTP_OK;
-    /*snprintf (buffer,
-              sizeof (buffer),
-              askPage,
-              nr_of_uploading_clients);*/
+    con_info->answercode = MHD_HTTP_OK;    
     con_info->answerstring = GETPage;
     printf("GET operation\n");
     //free (con_info);
@@ -470,10 +501,14 @@ echo_response (void *cls,
       fclose (con_info->fp);
       con_info->fp = NULL;
     }
+    if (con_info->value == "" || con_info->value == NULL) {
+      con_info->answerstring = postProcError;
+      con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
+    }
     if (0 == con_info->answercode)
     {
       /* No errors encountered, declare success */
-      printf("upload success\n");
+      printf("string upload success\n");
       con_info->answerstring = completePage;
       con_info->answercode = MHD_HTTP_OK;
       if (con_info->posttype==0) 
@@ -508,7 +543,9 @@ echo_response (void *cls,
         free(filename);
         fclose(fp);
       }
-        
+      else {
+        printf("file upload success");
+      }        
     }
       
     return send_page (connection,
@@ -524,8 +561,7 @@ echo_response (void *cls,
 
 
 
-static int
-ahc_cancel (void *cls,
+static int ahc_cancel (void *cls,
 	    struct MHD_Connection *connection,
 	    const char *url,
 	    const char *method,
@@ -535,7 +571,6 @@ ahc_cancel (void *cls,
 {
   struct MHD_Response *response;
   int ret;
-
 
   if (*unused == NULL)
     {
@@ -566,9 +601,10 @@ main (int argc, char *const *argv)
 {
   //unsigned int errorCount = 0;
   struct MHD_Daemon *d;
-  d = MHD_start_daemon (MHD_USE_THREAD_PER_CONNECTION | MHD_USE_INTERNAL_POLLING_THREAD ,
+  d = MHD_start_daemon (MHD_USE_THREAD_PER_CONNECTION | MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG ,
                         PORT,
-                        NULL, NULL, &echo_response, NULL,
+                        NULL, NULL, 
+                        &echo_response, NULL,
                         MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int) 10,
                         MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL, 
                         MHD_OPTION_END);
