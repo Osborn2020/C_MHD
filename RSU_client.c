@@ -165,8 +165,8 @@ testPost ()
   curl_easy_setopt (c, CURLOPT_URL, SERVER_URL);
   curl_easy_setopt (c, CURLOPT_WRITEFUNCTION, &copyBuffer);
   curl_easy_setopt (c, CURLOPT_WRITEDATA, &cbc);
-  curl_easy_setopt (c, CURLOPT_POSTFIELDS, POST_DATA);
-  curl_easy_setopt (c, CURLOPT_POSTFIELDSIZE, strlen (POST_DATA));
+  curl_easy_setopt (c, CURLOPT_POSTFIELDS, EMPTY_POST);
+  curl_easy_setopt (c, CURLOPT_POSTFIELDSIZE, strlen (EMPTY_POST));
   curl_easy_setopt (c, CURLOPT_POST, 1L);
   curl_easy_setopt (c, CURLOPT_FAILONERROR, 1);
   curl_easy_setopt (c, CURLOPT_TIMEOUT, 150L);

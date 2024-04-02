@@ -1,43 +1,51 @@
-
-//#include "MHD_config.h"
-//#include "platform.h"
 //#include <curl/curl.h>
 #include <microhttpd.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <time.h>
 #include <stdio.h>
 #ifndef WINDOWS
 #include <unistd.h>
 #endif
-
-//#define POST_DATA "RSUNAME=S290001&RSUID=16004&SIGNAL_CONTROLLER_MANUFACTURER=cheng_long"
+#include<json-c/json.h>
+#include<json-c/bits.h>
 
 #define PORT            10168
 //#define PORT            10003
 #define POSTBUFFERSIZE  2048
 #define MAXCLIENTS      10
+#define MAX_JSON_SIZE 4096
+#define JSON_NUM_BUF 200
+
+#define NULL_NULL		"NULL"
+#define BOOL_BOOLEAN	"BOOLEAN"
+#define STR_STRING		"STRING"
+#define NUM_INTEGER		"NUMBER"
+#define NUM_DOUBLE		"DOUBLE"
+#define ARR_ARRAY		"ARRAY"
+#define OBJ_OBJECT		"OBJECT"
+#define NULL_MEMBER_NULL	"MEMBER_NULL"
+#define BOOL_MEMBER_BOOLEAN	"MEMBER_BOOLEAN"
+#define STR_MEMBER_STRING	"MEMBER_STRING"
+#define NUM_MEMBER_INTEGER	"MEMBER_NUMBER"
+#define NUM_MEMBER_DOUBLE	"MEMBER_DOUBLE"
+#define ARR_MEMBER_ARRAY	"MEMBER_ARRAY"
 
 /*write data buffer*/
+struct JSONhandler
+{
+  char *data;
+  size_t len;
+  size_t size;
+};
+
 struct CBC
 {
   char *buf;
   size_t pos;
   size_t size;
 };
-
-/*write function for CURL*/
-static size_t
-copyBuffer (void *ptr, size_t size, size_t nmemb, void *ctx)
-{
-  struct CBC *cbc = ctx;
-
-  if (cbc->pos + size * nmemb > cbc->size)
-    return 0;                   /* overflow */
-  memcpy (&cbc->buf[cbc->pos], ptr, size * nmemb);
-  cbc->pos += size * nmemb;
-  return size * nmemb;
-}
 
 enum ConnectionType
 {
@@ -48,10 +56,20 @@ enum ConnectionType
   OPTIONS = 4
 };
 
+enum JsonType
+{
+  STRING = 0,
+  INT = 1,
+  DOUBLE = 2,
+  BOOL = 3,
+  ARRAY = 4,
+  OBJECT = 5,
+  NULL_N = 6
+};
+
 static unsigned int nr_of_uploading_clients = 0;
-/**
- * Information we keep per connection.
- */
+
+/* Information we keep per connection. */
 struct connection_info_struct
 {
   enum ConnectionType connectiontype;
@@ -75,14 +93,26 @@ struct connection_info_struct
    * HTTP status code we will return, 0 for undecided.
    */
   unsigned int answercode;
+
   /**
    * String submitted.
    */
-  char value[1024];
+  char value[2048];
 
+  /**
+   * Type of data posted.
+   */
   int posttype;
 
+  /**
+   * File name to write uploaded data.
+   */
   char *filename[100];
+
+  /**
+   * JSON string from client.
+   */
+  //struct json_object *json_root;
 };
 
 const char *askPage =
@@ -129,6 +159,18 @@ const char *GETPage =
   "<html><body>Use POST with string or form to update your config.</body></html>";
 const char*const noParaError =
   "<html><head><title>ParaError</title></head><body>POST URL has no parameters</body></html>";
+
+const char *keys[] = {"RSUNAME", "RSUID", "RSULONG", "RSULAT",\
+                      "SIGNAL_CONTROL_MANUFACTURER", "SIGNAL_STATUS_REPORT_ACTIVE",\
+                      "SIGNAL_ADJUST_UPPER_BOUND_ACTIVE", "SIGNAL_ADJUST_LOWER_BOUND_ACTIVE",\
+                      "SIGNAL_ADJUST_UPPER_BOUND_PERCENTAGE", "SIGNAL_ADJUST_LOWER_BOUND_PERCENTAGE",\
+                      "LOG_MIDDLEWARE_TIMER_EVENT", "LOG_APPLICATION_REGISTER_EVENT",\
+                      "LOG_COMMAND_BUFFER", "LOG_SIGNAL_PACKET_RX",\
+                      "LOG_SIGNAL_PACKET_TX", "LOG_SIGNAL_PACKET_INFO",\
+                      "LOG_CLOUD_PACKET_RX", "LOG_CLOUD_PACKET_TX",\
+                      "LOG_OBU_PACKET_RX", "LOG_OBU_PACKET_TX",\
+                      "TRAFFIC_COMPENSATION_METHOD","TRAFFIC_COMPENSATION_CYCLE_NUMBER",\
+                      "PHASE_WEIGHT","WriteToFile"};
 /*write function for CURL*/
 static size_t
 copyBuffer (void *ptr, size_t size, size_t nmemb, void *ctx)
@@ -142,7 +184,7 @@ copyBuffer (void *ptr, size_t size, size_t nmemb, void *ctx)
   return size * nmemb;
 }
 
-
+/*analyze url to check POST data type*/
 static enum MHD_Result
 parse_url (void *cls,
 	     enum MHD_ValueKind kind,
@@ -153,6 +195,8 @@ parse_url (void *cls,
   int matches = 0;
 
   printf("key: %s\n",key);
+  printf("value: %s\n",key);
+
   if (0 == strcmp (key, "file"))
   {
     matches = 99; //unique value for FILE posts
@@ -166,9 +210,10 @@ parse_url (void *cls,
   }
   else 
   {
-    matches = 0;
+    matches = 0; // value for string/form posts
     num_of_keys += 1;
   }
+
   printf("amount of keys: %d\n",num_of_keys);
   
   if (num_of_keys==0) {
@@ -196,23 +241,146 @@ iterate_post_string (void *cls,
                const char *value, uint64_t off, size_t size)
 {
   struct connection_info_struct *con_info = cls;
+
   if (key==NULL || strlen(key)==0) {
-    printf("error: cannot accept empty key\n")
+    printf("error: cannot accept empty key\n");
     return MHD_NO;
   }
-  printf("key: %s\n",key);
-  printf("value: %s\n",value);
+  //printf("key: %s\n",key);
+  //printf("value: %s\n",value);
   //printf("content_type: %s\n",content_type);
   //printf("size=%zu\n",size);
-  if (0 != strcasecmp(key,"WriteToFile")) { // key is not WriteToFile (config filename)
+
+  //const char* Jstring;
+  /*read JSON string*/
+  if (0 == strcasecmp(key,"json")) {    
+    printf("read JSON string\n");
+    struct json_object *root; 
+    struct json_object *tmp_obj, *name, *ID, *filename; // child nodes, freed when parent is frees
+    root = json_tokener_parse(value);
+    // Use is_error() to check the result, don't use "j_root == NULL".
+    if (is_error(root)) {
+      printf("parse failed.");
+      exit(-1);
+    }
+    /*keys that must exist*/
+    name = json_object_object_get(root, "RSUNAME");
+    ID = json_object_object_get(root, "RSUID");
+    filename = json_object_object_get(root, "WriteToFile");
+    if (!name || !ID|| !filename ) {
+      printf("parse failed.");
+      json_object_put(root);
+      return MHD_NO;
+    }
+
+    enum json_type type = json_object_get_type(root);
+    char bufferNum[200];
+    int tmpI;
+    double tmpD;
+    /*loop through JSON object*/
+    json_object_object_foreach(root, key, val) {
+      type = json_object_get_type(val);
+      char *Jtype = json_type_to_name(type);
+      printf("type: %s\n",Jtype);
+      printf("key: %s\n",key);
+      tmp_obj = json_object_object_get(root, key);
+      
+      switch (type) {
+      case json_type_null:
+        printf("json_type_null\n");
+        break;
+      case json_type_boolean:
+        printf("json_type_boolean\n");
+        const char* s = (json_object_get_boolean(tmp_obj) == true) ? "yes" : "no";
+        strncat(con_info->value,key,strlen(key)+1);
+        strcat(con_info->value,": ");
+        strncat(con_info->value,s,strlen(s)+1);
+        strcat(con_info->value,"\n");
+        break;
+      case json_type_double:
+        printf("json_type_double\n");
+        //char bufferD[100];
+        tmpD = json_object_get_double(tmp_obj);
+        printf("double value: %f\n",tmpD);
+        snprintf(bufferNum, sizeof(bufferNum),"%f", tmpD);
+        strncat(con_info->value,key,strlen(key)+1);
+        strcat(con_info->value,": ");
+        strncat(con_info->value,bufferNum,strlen(bufferNum)+1);
+        strcat(con_info->value,"\n");
+        strcpy(bufferNum,"");
+        break;
+      case json_type_int:
+        printf("json_type_int\n");
+        tmpI = json_object_get_int(tmp_obj);
+        printf("int value: %d\n",tmpI);  
+        snprintf(bufferNum, sizeof(bufferNum),"%d", tmpI);
+        strncat(con_info->value,key,strlen(key)+1);
+        strcat(con_info->value,": ");
+        strncat(con_info->value,bufferNum,strlen(bufferNum)+1);
+        strcat(con_info->value,"\n");
+        strcpy(bufferNum,"");
+        break;
+      case json_type_object:
+        printf("json_type_object\n");
+        break;
+      case json_type_array:
+        printf("json_type_array\n");
+        printf("array size = %d\n", json_object_array_length(tmp_obj));
+        if (0==strcmp(key,"PHASE_WEIGHT")) {
+          json_object *tmp_obj1 = NULL;
+          int i;
+          char buffertemp[200];
+          for (i=0; i<json_object_array_length(tmp_obj); i++){
+            tmp_obj1 = json_object_array_get_idx(tmp_obj, i);
+            tmpI = json_object_get_int(tmp_obj1);
+            printf("array int value at ID [%d]: %d\n",i,tmpI);
+            if (i==0) {
+              snprintf(buffertemp, 200,"%d ", tmpI);
+            }
+            else {
+              snprintf(buffertemp+strlen(buffertemp), 200-strlen(buffertemp),"%d ", tmpI);
+            }
+          }
+          snprintf(bufferNum, sizeof(bufferNum),"%s", buffertemp);
+          strncat(con_info->value,key,strlen(key)+1);
+          strcat(con_info->value,": ");
+          strncat(con_info->value,bufferNum,strlen(bufferNum)+1);
+          strcat(con_info->value,"\n");
+          strcpy(bufferNum,"");
+        }
+        break;
+      case json_type_string:
+        printf("json_type_string\n");
+        printf("%s = %s\n", key, json_object_get_string(tmp_obj));
+        if (0!=strcasecmp(key,"WriteToFile")) {
+          strncat(con_info->value,key,strlen(key)+1);
+          strcat(con_info->value,": ");
+          strcat(con_info->value,json_object_get_string(tmp_obj));
+          strcat(con_info->value,"\n");
+        }
+        else {
+          strcat(con_info->filename,json_object_get_string(tmp_obj));
+        }
+        //*tmp = 0;
+        break;
+      }
+    }
+    //char *str;
+    //str = (char *) json_object_get_string(filename);
+    //printf("JSON filename: %s\n",str);
+    //strcat(con_info->filename,str);
+    //json_object_put(con_info->json_root);
+    json_object_put(root);
+  }
+  else if (0 == strcasecmp(key,"WriteToFile")){ // key is config filename
+    printf("bring file\n");
+    strcat(con_info->filename,value);
+  }
+  else { // key is config data
     strncat(con_info->value,key,strlen(key)+1);
     strcat(con_info->value,": ");
     strcat(con_info->value,value);
     strcat(con_info->value,"\n");
-  }
-  else {
-    printf("bring file\n");
-    strcat(con_info->filename,value);
   }
   
   return MHD_YES;
@@ -220,7 +388,7 @@ iterate_post_string (void *cls,
 
 /* send file through POST */
 static enum MHD_Result
-iterate_post_file (void *coninfo_cls,
+iterate_post_file (void *cls,
               enum MHD_ValueKind kind,
               const char *key,
               const char *filename,
@@ -230,7 +398,7 @@ iterate_post_file (void *coninfo_cls,
               uint64_t off,
               size_t size)
 {
-  struct connection_info_struct *con_info = coninfo_cls;
+  struct connection_info_struct *con_info = cls;
   FILE *fp;
   (void) kind;               /* Unused. Silent compiler warning. */
   (void) content_type;       /* Unused. Silent compiler warning. */
@@ -288,26 +456,64 @@ send_page (struct MHD_Connection *connection,
 {
   enum MHD_Result ret;
   struct MHD_Response *response;
+  struct json_object *json_obj = NULL;
+  struct json_object *tmp_obj = NULL; //child to json_obj
+  int JSONlen;
+  
+  printf("status: %d\n",status_code);
+  //new a base object
+	json_obj = json_object_new_object();
+	if (!json_obj)
+	{
+		printf("Cannot create object\n");
+		ret = -1;
+    json_object_put(json_obj);
+    return MHD_NO;
+		//goto error;
+	}
+  //new a integer
+	tmp_obj = json_object_new_int(status_code);
+	if (!tmp_obj)
+	{
+		printf("Cannot create number object for %s\n", "response");
+		ret = -1;
+    json_object_put(json_obj);
+		return MHD_NO;
+    //goto error;
+	}
+	json_object_object_add(json_obj, "response", tmp_obj);
+	tmp_obj = NULL;
 
+  JSONlen = json_object_get_string_len(json_obj);
+  printf("JSON length: %d\n",JSONlen);
+  char *buffer = json_object_to_json_string(json_obj);
+  printf("JSON return: %s\n",buffer);
+  
   response =
-    MHD_create_response_from_buffer (strlen (page),
-                                     (void *) page,
+    MHD_create_response_from_buffer (strlen(buffer),
+                                     (void*)buffer,
                                      MHD_RESPMEM_MUST_COPY);
   if (! response)
     return MHD_NO;
+  /*
   MHD_add_response_header (response,
                            MHD_HTTP_HEADER_CONTENT_TYPE,
                            "text/html");
+  */
+  MHD_add_response_header (response,
+                           "content-type",
+                           "application/json");                         
   ret = MHD_queue_response (connection,
                             status_code,
                             response);
+  printf("created response\n"); 
   MHD_destroy_response (response);
+  json_object_put(json_obj);
 
   return ret;
 }
 
-
-
+/*handle finished requests*/
 static void
 request_completed (void *cls,
                    struct MHD_Connection *connection,
@@ -317,7 +523,8 @@ request_completed (void *cls,
   printf("request complete\n");
   
   struct connection_info_struct *con_info = *con_cls;
-  enum XToe = toe;
+  //enum *XToe = toe;
+  /*
   if (XToe==MHD_REQUEST_TERMINATED_WITH_ERROR) {
     printf("connection suffered an error\n");
     memset(&con_info->value[0], 0, sizeof(con_info->value)); // reset connection info POST value
@@ -333,6 +540,7 @@ request_completed (void *cls,
     *con_cls = NULL;
     return;
   }
+  */
   //(void) cls;         /* Unused. Silent compiler warning. */
   //(void) connection;  /* Unused. Silent compiler warning. */
   //(void) toe;         /* Unused. Silent compiler warning. */
@@ -343,12 +551,13 @@ request_completed (void *cls,
     return;
   }
 
-  if (1 == (con_info->connectiontype == POST))// is POST
+  if (1 == (con_info->connectiontype == POST)) // is POST
   {
     nr_of_uploading_clients--;
     printf("POST type post-complete:\n");
     memset(&con_info->value[0], 0, sizeof(con_info->value)); // reset connection info POST value
     memset(&con_info->filename[0], 0, sizeof(con_info->filename));
+    //json_object_put(con_info->json_root);
     if (NULL != con_info->pp)
     {
       MHD_destroy_post_processor (con_info->pp);  
@@ -357,6 +566,7 @@ request_completed (void *cls,
     if (con_info->fp)
       fclose (con_info->fp);
   }
+
   else {
       printf("connection type is not POST\n");
   }
@@ -366,7 +576,8 @@ request_completed (void *cls,
   *con_cls = NULL;
 }
 
-static enum MHD_result
+/*respond to client request*/
+static int
 echo_response (void *cls,
           struct MHD_Connection *connection,
           const char *url,
@@ -379,10 +590,14 @@ echo_response (void *cls,
   //struct MHD_Response *response;
   //enum MHD_result ret;
   static int posttype;
+  struct JSONhandler *jason;
+  static int content_len=0;
   
   printf("URL: %s\n",url);
   printf("method: %s\n",method);
-  printf("upload_data: %s\n",upload_data);
+  //printf("size: %zu\n",upload_data_size);
+  //printf("upload_data: %s\n",upload_data);
+  //printf(connection->headers_received);
   
   
   if (NULL == *con_cls)
@@ -407,10 +622,17 @@ echo_response (void *cls,
     con_info->posttype = MHD_get_connection_values (connection,
           MHD_GET_ARGUMENT_KIND,
           &parse_url,
-          NULL);
+          url);
+    
     if (0 == strcasecmp (method, MHD_HTTP_METHOD_POST))
     {
-      
+      const char* param = MHD_lookup_connection_value (connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_LENGTH);
+      content_len = atoi(param);
+      const char* type = MHD_lookup_connection_value (connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_TYPE);
+      const char* body = MHD_lookup_connection_value (connection, MHD_POSTDATA_KIND, NULL);
+      printf("length of content: %d\n",content_len);
+      printf("type of content: %s\n",type);
+      //printf(strcmp(type,"application/json"));
       if (con_info->posttype==99) { // has "file" key
         printf("handle as file POST\n");
         con_info->pp =
@@ -425,31 +647,50 @@ echo_response (void *cls,
                         noParaError,
                         MHD_HTTP_SERVICE_UNAVAILABLE); // HTTP 503
       }
-      else { // no "file" key, POST data is string type or form type
+      else { // no "file" key, POST data is string/form/JSON
         printf("handle as string POST\n");
         printf("con_info->posttype: %d\n",con_info->posttype);
-        con_info->pp =
+        if (0==strcmp(type,"application/json")) // new connection
+        {
+          con_info->posttype = 2;
+          printf("accept type: JSON");
+          printf("con_info->posttype: %d\n",con_info->posttype);
+          jason = (char*)malloc (MAX_JSON_SIZE);
+          if (NULL == jason)
+              return MHD_NO;
+
+          jason->len = 0; //actual data load
+          jason->data = malloc(content_len + 1);
+          memset(jason->data, 0, content_len+1);
+        }
+        else {
+          con_info->pp =
           MHD_create_post_processor (connection,
                                      POSTBUFFERSIZE,
                                      &iterate_post_string,
                                      (void *) con_info);
+        }        
       }
-
+      if (content_len==0) { // empty POST
+        printf("POST error: require parameters\n");
+        return send_page (connection,
+                        noParaError,
+                        MHD_HTTP_SERVICE_UNAVAILABLE); // HTTP 503
+      }
       if (NULL == con_info->pp)
       {
         free (con_info);
         return MHD_NO;
       }
-
       nr_of_uploading_clients++;
-
-      con_info->connectiontype = POST;
-      
+      con_info->connectiontype = POST;      
     }
+
     else
     {
       con_info->connectiontype = GET;
     }
+
     printf("confirmed request: %d\n",con_info->connectiontype);
     *con_cls = (void *) con_info;
     return MHD_YES;
@@ -475,6 +716,10 @@ echo_response (void *cls,
     
     if (0 != *upload_data_size)
     {
+      const char* param = MHD_lookup_connection_value (connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_LENGTH);
+      content_len = atoi(param);
+      const char* body = MHD_lookup_connection_value (connection, MHD_POSTDATA_KIND, NULL);
+      
       /* Upload not yet done */
       if (0 != con_info->answercode)
       {
@@ -482,16 +727,25 @@ echo_response (void *cls,
         *upload_data_size = 0;
         return MHD_YES;
       }
-      if (MHD_YES !=
+      /* use custom method for JSON */
+      if (0 == strncasecmp(url, "/api/json", 9)) { 
+        memcpy (jason->data + jason->len, upload_data, *upload_data_size);
+        jason->len = jason->len + (*upload_data_size);
+        ((char *)(jason->data))[jason->len] = '/0';
+      }
+      /* use MHD method for string and form type */
+      else { 
+        if (MHD_YES !=
           MHD_post_process (con_info->pp,
                             upload_data,
                             *upload_data_size))
-      {
-        con_info->answerstring = postProcError;
-        con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
+        {
+          con_info->answerstring = postProcError;
+          con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
+        }
       }
+      /* indicate that we have processed */
       *upload_data_size = 0;
-
       return MHD_YES;
     }
     /* Upload finished */
@@ -501,7 +755,7 @@ echo_response (void *cls,
       fclose (con_info->fp);
       con_info->fp = NULL;
     }
-    if (con_info->value == "" || con_info->value == NULL) {
+    if (con_info->value == NULL) {
       con_info->answerstring = postProcError;
       con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -517,37 +771,67 @@ echo_response (void *cls,
         FILE *fp;
         char *filename = (char*)malloc(sizeof(100));
         *filename = 0;
-        //char ID[10] = "S290001";
         //strncat(filename,"RSUID_",strlen("RSUID_")+1);
         strncat(filename,con_info->filename,strlen(con_info->filename)+1);
         strncat(filename,".txt",strlen(".txt")+1);
         //strncat(con_info->filename,".txt",strlen(".txt")+1);
         printf(con_info->value);
-        /*
-        if (NULL != (fp = fopen (filename, "rb")))
-        {
-          fclose (fp);
-          con_info->answerstring = fileExistsPage;
-          con_info->answercode = MHD_HTTP_FORBIDDEN;
-          return send_page (connection,
-                      con_info->answerstring,
-                      con_info->answercode);
-        }
-        */
         fp = fopen (filename, "wb");
         if (! fprintf (fp,con_info->value))
         {
           printf("write file error\n");
+          con_info->answerstring = postProcError;
+          con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
         }
         *filename = 0;
         free(filename);
         fclose(fp);
       }
+      else if (con_info->posttype==2) {
+        // write JSON to file
+        if (content_len != jason->len) {
+          con_info->answerstring = postProcError;
+          con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        else {
+          printf(jason->data);
+          json_object *test_obj = jason->data;
+          json_object *tmp_obj = NULL;
+          json_object *tmp_obj2 = NULL;
+          tmp_obj = json_object_object_get(test_obj, "RSUID");
+          if (!tmp_obj)
+          {
+            printf("Cannot get RSUID object\n");
+            con_info->answerstring = postProcError;
+            con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
+          }
+	        printf("RSUID = %s\n", json_object_get_string(tmp_obj));
+
+          tmp_obj2 = json_object_object_get(test_obj, "WriteToFile");
+          if (!tmp_obj2)
+          {
+            printf("Cannot get filename\n");
+            con_info->answerstring = postProcError;
+            con_info->answercode = MHD_HTTP_INTERNAL_SERVER_ERROR;
+          }
+          else {
+            printf("filename = %s\n", json_object_get_string(tmp_obj2));
+            char *filename = (char*)malloc(sizeof(100));
+            *filename = 0;
+            //strncat(filename,"RSUID_",strlen("RSUID_")+1);
+            strncat(filename,tmp_obj2,strlen(tmp_obj2)+1);
+            strncat(filename,".json",strlen(".json")+1);
+            json_object_to_file(filename, test_obj);
+            *filename = 0;
+            free(filename);
+          }
+	        
+        }
+      }
       else {
         printf("file upload success");
       }        
     }
-      
     return send_page (connection,
                       con_info->answerstring,
                       con_info->answercode);
@@ -558,8 +842,6 @@ echo_response (void *cls,
                     errorPage,
                     MHD_HTTP_BAD_REQUEST);
 }
-
-
 
 static int ahc_cancel (void *cls,
 	    struct MHD_Connection *connection,
@@ -594,10 +876,7 @@ static int ahc_cancel (void *cls,
     }
 }
 
-
-
-int
-main (int argc, char *const *argv)
+int main (int argc, char *const *argv)
 {
   //unsigned int errorCount = 0;
   struct MHD_Daemon *d;
